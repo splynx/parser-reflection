@@ -10,70 +10,76 @@ declare(strict_types=1);
  * with this source code in the file LICENSE.
  */
 
-namespace Go\ParserReflection\ValueResolver;
+namespace Go\ParserReflection\Resolver;
 
 use Go\ParserReflection\ReflectionClass;
 use Go\ParserReflection\ReflectionException;
 use Go\ParserReflection\ReflectionFileNamespace;
+use Go\ParserReflection\ReflectionNamedType;
 use PhpParser\Node;
+use PhpParser\Node\Const_;
 use PhpParser\Node\Expr;
-use PhpParser\Node\Scalar\DNumber;
-use PhpParser\Node\Scalar\LNumber;
+use PhpParser\Node\Name;
+use PhpParser\Node\Param;
+use PhpParser\Node\Scalar\Float_;
+use PhpParser\Node\Scalar\Int_;
 use PhpParser\Node\Scalar\MagicConst\Line;
 use PhpParser\Node\Scalar\String_;
 use PhpParser\Node\Stmt\Expression;
+use PhpParser\PrettyPrinter\Standard;
 use ReflectionFunctionAbstract;
 use ReflectionMethod;
 
 /**
  * Tries to resolve expression into value
+ * @see \Go\ParserReflection\Resolver\NodeExpressionResolverTest
  */
 class NodeExpressionResolver
 {
 
     /**
      * List of exception for constant fetch
-     *
-     * @var array
      */
-    private static $notConstants = [
+    private static array $notConstants = [
         'true'  => true,
         'false' => true,
         'null'  => true,
     ];
 
     /**
-     * Name of the constant (if present)
-     *
-     * @var ?string
-     */
-    private $constantName;
-
-    /**
      * Current reflection context for parsing
-     *
-     * @var mixed|ReflectionClass
      */
-    private $context;
+    private
+        \ReflectionClass|\ReflectionFunction|\ReflectionMethod|\ReflectionClassConstant|
+        \ReflectionParameter|\ReflectionAttribute|\ReflectionProperty|ReflectionFileNamespace|null $context;
 
     /**
-     * Flag if expression is constant
-     *
-     * @var bool
+     * Flag if given expression is constant
      */
-    private $isConstant = false;
+    private bool $isConstant = false;
+
+    /**
+     * If given expression is constant-like (used mostly for dumping string representation) of node in reflection
+     */
+    private bool $isConstExpr = false;
+
+    /**
+     * Name of the constant (if present), used to collect references to constants for misc places
+     * @see $isConstant
+     */
+    private ?string $constantName;
 
     /**
      * Node resolving level, 1 = top-level
-     *
-     * @var int
      */
-    private $nodeLevel = 0;
+    private int $nodeLevel = 0;
 
     /**
-     * @var mixed Value of expression/constant
+     * @var Node[]
      */
-    private $value;
+    private array $nodeStack = [];
+
+    private mixed $value;
 
     public function __construct($context)
     {
@@ -85,7 +91,7 @@ class NodeExpressionResolver
         return $this->constantName;
     }
 
-    public function getValue()
+    public function getValue(): mixed
     {
         return $this->value;
     }
@@ -95,49 +101,142 @@ class NodeExpressionResolver
         return $this->isConstant;
     }
 
-    public function process(Node $node): void
+    public function isConstExpression(): bool
     {
-        // Unwrap "expr;" statements.
-        if ($node instanceof Expression) {
-            $node = $node->expr;
+        return $this->isConstExpr;
+    }
+
+    public function getConstExpression(): ?string
+    {
+        $expression = null;
+        if ($this->isConstExpr) {
+            // Clone node to avoid possible side-effects
+            $node = clone $this->nodeStack[$this->nodeLevel];
+            if ($node instanceof Expr\ConstFetch) {
+                $constantNodeName = $node->name;
+                // Unpack fully-resolved name if we have it inside attribute
+                if ($constantNodeName->hasAttribute('resolvedName')) {
+                    $constantNodeName = $constantNodeName->getAttribute('resolvedName');
+                }
+                if ($constantNodeName->isFullyQualified()) {
+                    // For full-qualified names we would like to remove leading "\"
+                    $node->name = new Name(ltrim($constantNodeName->toString(), '\\'));
+                } else {
+                    // For relative names we would like to add namespace prefix
+                    $node->name = new Name($this->resolveScalarMagicConstNamespace() . '\\' . $constantNodeName->toString());
+                }
+            }
+            // All long array nodes are pretty-printed by PHP in short format
+            if ($node instanceof Expr\Array_ && $node->getAttribute('kind') === Expr\Array_::KIND_LONG) {
+                $node->setAttribute('kind', Expr\Array_::KIND_SHORT);
+            }
+            $printer    = new Standard(['shortArraySyntax' => true]);
+            $expression = $printer->prettyPrintExpr($node);
         }
 
+        return $expression;
+    }
+
+    /**
+     * @throws ReflectionException If node could not be resolved
+     */
+    final public function process(Node $node): void
+    {
         $this->nodeLevel    = 0;
+        $this->nodeStack    = [$node]; // Always keep the root node
         $this->isConstant   = false;
+        $this->isConstExpr  = false;
         $this->constantName = null;
         $this->value        = $this->resolve($node);
     }
 
     /**
-     * Resolves node into valid value
+     * Recursively resolves node into valid value
      *
-     * @param Node $node
-     *
-     * @return mixed
+     * @throws ReflectionException If couldn't resolve value for given Node
      */
-    protected function resolve(Node $node)
+    final protected function resolve(Node $node): mixed
     {
         $value = null;
         try {
+            $this->nodeStack[] = $node;
             ++$this->nodeLevel;
+            if ($this->nodeLevel > 1 && $this->isConstant) {
+                $this->isConstant   = false;
+                $this->constantName = null;
+            }
 
             $methodName = $this->getDispatchMethodFor($node);
-            if (method_exists($this, $methodName)) {
-                $value = $this->$methodName($node);
+            if (!method_exists($this, $methodName)) {
+                throw new ReflectionException("Could not find handler for the " . __CLASS__ . "::{$methodName} method");
             }
+            $value = $this->$methodName($node);
         } finally {
+            array_pop($this->nodeStack);
             --$this->nodeLevel;
         }
 
         return $value;
     }
 
-    protected function resolveScalarDNumber(DNumber $node): float
+    protected function resolveStmtExpression(Expression $node): mixed
+    {
+        // Just unwrap "expr;" statements.
+
+        return $this->resolve($node->expr);
+    }
+
+    protected function resolveNameFullyQualified(Name\FullyQualified $node): string
+    {
+        return $node->toString();
+    }
+
+    private function resolveName(Name $node): string
+    {
+        if ($node->hasAttribute('resolvedName')) {
+            return $node->getAttribute('resolvedName')->toString();
+        }
+
+        return $node->toString();
+    }
+
+    protected function resolveIdentifier(Node\Identifier $node): string
+    {
+        return $node->toString();
+    }
+
+    /**
+     * @throws \Throwable In case of any errors during function evaluation
+     */
+    protected function resolveExprFuncCall(Expr\FuncCall $node): mixed
+    {
+        $functionName = $this->resolve($node->name);
+        $resolvedArgs = [];
+        foreach ($node->args as $argumentNode) {
+            $value = $this->resolve($argumentNode->value);
+            // if function uses named arguments, then unpack argument name first
+            if (isset($argumentNode->name)) {
+                $name = $this->resolve($argumentNode->name);
+                $resolvedArgs[$name] = $value;
+            } else {
+                // otherwise simply add argument to the list
+                $resolvedArgs[] = $value;
+            }
+        }
+
+        $reflectedFunction = new \ReflectionFunction($functionName);
+        if (!$reflectedFunction->isInternal()) {
+            throw new ReflectionException("Only internal PHP functions can be evaluated safely");
+        }
+        return $reflectedFunction->invoke(...$resolvedArgs);
+    }
+
+    protected function resolveScalarFloat(Float_ $node): float
     {
         return $node->value;
     }
 
-    protected function resolveScalarLNumber(LNumber $node): int
+    protected function resolveScalarInt(Int_ $node): int
     {
         return $node->value;
     }
@@ -147,84 +246,100 @@ class NodeExpressionResolver
         return $node->value;
     }
 
+    /**
+     * @throws ReflectionException If not in the context of parsing method body
+     */
     protected function resolveScalarMagicConstMethod(): string
     {
-        if ($this->context instanceof ReflectionMethod) {
-            $fullName = $this->context->getDeclaringClass()->name . '::' . $this->context->getShortName();
-
-            return $fullName;
+        if (!$this->context instanceof ReflectionMethod) {
+            throw new ReflectionException("Could not resolve __METHOD__ without method context");
         }
 
-        return '';
+        return $this->context->getDeclaringClass()->name . '::' . $this->context->getShortName();
     }
 
+    /**
+     * @throws ReflectionException If not in the context of parsing function body
+     */
     protected function resolveScalarMagicConstFunction(): string
     {
-        if ($this->context instanceof ReflectionFunctionAbstract) {
-            return $this->context->getName();
+        if (!$this->context instanceof ReflectionFunctionAbstract) {
+            throw new ReflectionException("Could not resolve __FUNCTION__ without function context");
         }
 
-        return '';
+        return $this->context->getName();
     }
 
+    /**
+     * @throws ReflectionException If not inside ReflectionFileNamespace or context doesn't have getNamespaceName()
+     */
     protected function resolveScalarMagicConstNamespace(): string
     {
-        if (method_exists($this->context, 'getNamespaceName')) {
-            return $this->context->getNamespaceName();
-        }
-
         if ($this->context instanceof ReflectionFileNamespace) {
             return $this->context->getName();
         }
+        if (!method_exists($this->context, 'getNamespaceName')) {
+            throw new ReflectionException("Could not resolve __NAMESPACE__ without having getNamespaceName");
+        }
 
-        return '';
+        return $this->context->getNamespaceName();
     }
 
+    /**
+     * @throws ReflectionException If not inside ReflectionClass or class children nodes
+     */
     protected function resolveScalarMagicConstClass(): string
     {
         if ($this->context instanceof \ReflectionClass) {
             return $this->context->name;
         }
-        if (method_exists($this->context, 'getDeclaringClass')) {
-            $declaringClass = $this->context->getDeclaringClass();
-            if ($declaringClass instanceof \ReflectionClass) {
-                return $declaringClass->name;
-            }
+        if (!method_exists($this->context, 'getDeclaringClass')) {
+            throw new ReflectionException("Could not resolve __CLASS__ without having getDeclaringClass");
         }
+        $declaringClass = $this->context->getDeclaringClass();
 
-        return '';
+        return $declaringClass->name;
     }
 
+    /**
+     * @throws ReflectionException If ReflectionContext doesn't have getFileName
+     */
     protected function resolveScalarMagicConstDir(): string
     {
-        if (method_exists($this->context, 'getFileName')) {
-            return dirname($this->context->getFileName());
+        if (!method_exists($this->context, 'getFileName')) {
+            throw new ReflectionException("Could not resolve __DIR__ without having getFileName");
         }
 
-        return '';
+        return dirname($this->context->getFileName());
     }
 
+    /**
+     * @throws ReflectionException If ReflectionContext doesn't have getFileName
+     */
     protected function resolveScalarMagicConstFile(): string
     {
-        if (method_exists($this->context, 'getFileName')) {
-            return $this->context->getFileName();
+        if (!method_exists($this->context, 'getFileName')) {
+            throw new ReflectionException("Could not resolve __FILE__ without having getFileName");
         }
 
-        return '';
+        return $this->context->getFileName();
     }
 
     protected function resolveScalarMagicConstLine(Line $node): int
     {
-        return $node->hasAttribute('startLine') ? $node->getAttribute('startLine') : 0;
+        return $node->getStartLine();
     }
 
+    /**
+     * @throws ReflectionException If not inside trait context
+     */
     protected function resolveScalarMagicConstTrait(): string
     {
-        if ($this->context instanceof \ReflectionClass && $this->context->isTrait()) {
-            return $this->context->name;
+        if (!$this->context instanceof \ReflectionClass || !$this->context->isTrait()) {
+            throw new ReflectionException("Could not resolve __TRAIT__ without trait context");
         }
 
-        return '';
+        return $this->context->name;
     }
 
     protected function resolveExprConstFetch(Expr\ConstFetch $node)
@@ -232,8 +347,13 @@ class NodeExpressionResolver
         $constantValue = null;
         $isResolved    = false;
 
-        $isFQNConstant = $node->name instanceof Node\Name\FullyQualified;
-        $constantName  = $node->name->toString();
+        $nodeConstantName = $node->name;
+        // If we have resolved type name
+        if ($nodeConstantName->hasAttribute('resolvedName')) {
+            $nodeConstantName = $nodeConstantName->getAttribute('resolvedName');
+        }
+        $isFQNConstant = $nodeConstantName instanceof Node\Name\FullyQualified;
+        $constantName  = $nodeConstantName->toString();
 
         if (!$isFQNConstant && method_exists($this->context, 'getFileName')) {
             $fileName      = $this->context->getFileName();
@@ -246,12 +366,17 @@ class NodeExpressionResolver
             }
         }
 
+        $isRealConstant = !isset(self::$notConstants[$constantName]);
         if (!$isResolved && defined($constantName)) {
             $constantValue = constant($constantName);
+            if (!$isFQNConstant) {
+                $constantName  = $this->context->getNamespaceName() . '\\' . $constantName;
+            }
         }
 
-        if ($this->nodeLevel === 1 && !isset(self::$notConstants[$constantName])) {
+        if ($this->nodeLevel === 1 && $isRealConstant) {
             $this->isConstant   = true;
+            $this->isConstExpr  = true;
             $this->constantName = $constantName;
         }
 
@@ -260,23 +385,29 @@ class NodeExpressionResolver
 
     protected function resolveExprClassConstFetch(Expr\ClassConstFetch $node)
     {
-        $classToReflect = $node->class;
-        if (!($classToReflect instanceof Node\Name)) {
-            $classToReflect = $this->resolve($classToReflect) ?: $classToReflect;
-            if (!is_string($classToReflect)) {
-                $reason = 'Unable';
-                if ($classToReflect instanceof Expr) {
-                    $methodName = $this->getDispatchMethodFor($classToReflect);
-                    $reason     = "Method " . __CLASS__ . "::{$methodName}() not found trying";
-                }
-                throw new ReflectionException("$reason to resolve class constant.");
+        $classToReflectNodeName = $node->class;
+        if (!($classToReflectNodeName instanceof Node\Name)) {
+            $classToReflectNodeName = $this->resolve($classToReflectNodeName);
+            if (!is_string($classToReflectNodeName)) {
+                throw new ReflectionException("Unable to resolve class constant.");
             }
             // Strings evaluated as class names are always treated as fully
             // qualified.
-            $classToReflect = new Node\Name\FullyQualified(ltrim($classToReflect, '\\'));
+            $classToReflectNodeName = new Node\Name\FullyQualified(ltrim($classToReflectNodeName, '\\'));
         }
-        $refClass     = $this->fetchReflectionClass($classToReflect);
-        $constantName = ($node->name instanceof Expr\Error) ? '' : $node->name->toString();
+        // Unwrap resolved class name if we have it inside attributes
+        if ($classToReflectNodeName->hasAttribute('resolvedName')) {
+            $classToReflectNodeName = $classToReflectNodeName->getAttribute('resolvedName');
+        }
+        $refClass = $this->fetchReflectionClass($classToReflectNodeName);
+        if (($node->name instanceof Expr\Error)) {
+            $constantName = '';
+        } else {
+            $constantName = match (true) {
+                $node->name->hasAttribute('resolvedName') => $node->name->getAttribute('resolvedName')->toString(),
+                default => $node->name->toString(),
+            };
+        }
 
         // special handling of ::class constants
         if ('class' === $constantName) {
@@ -284,13 +415,17 @@ class NodeExpressionResolver
         }
 
         $this->isConstant   = true;
-        $this->constantName = $classToReflect . '::' . $constantName;
+        $this->isConstExpr  = true;
+        $this->constantName = $classToReflectNodeName . '::' . $constantName;
 
         return $refClass->getConstant($constantName);
     }
 
     protected function resolveExprArray(Expr\Array_ $node): array
     {
+        // For array expressions we would like to have pretty-printed output too
+        $this->isConstExpr = true;
+
         $result = [];
         foreach ($node->items as $itemIndex => $arrayItem) {
             $itemValue        = $this->resolve($arrayItem->value);
@@ -301,31 +436,36 @@ class NodeExpressionResolver
         return $result;
     }
 
-    protected function resolveExprBinaryOpPlus(Expr\BinaryOp\Plus $node)
+    protected function resolveExprBinaryOpPlus(Expr\BinaryOp\Plus $node): int|float|array
     {
         return $this->resolve($node->left) + $this->resolve($node->right);
     }
 
-    protected function resolveExprBinaryOpMinus(Expr\BinaryOp\Minus $node)
+    protected function resolveExprBinaryOpMinus(Expr\BinaryOp\Minus $node): int|float
     {
         return $this->resolve($node->left) - $this->resolve($node->right);
     }
 
-    protected function resolveExprBinaryOpMul(Expr\BinaryOp\Mul $node)
+    protected function resolveExprBinaryOpMul(Expr\BinaryOp\Mul $node): int|float
     {
         return $this->resolve($node->left) * $this->resolve($node->right);
     }
 
-    protected function resolveExprBinaryOpPow(Expr\BinaryOp\Pow $node)
+    protected function resolveExprBinaryOpPow(Expr\BinaryOp\Pow $node): int|float
     {
         return $this->resolve($node->left) ** $this->resolve($node->right);
     }
 
-    protected function resolveExprBinaryOpDiv(Expr\BinaryOp\Div $node)
+    protected function resolveExprBinaryOpDiv(Expr\BinaryOp\Div $node): int|float
     {
         return $this->resolve($node->left) / $this->resolve($node->right);
     }
 
+    /**
+     * Operands of modulo are converted to int before processing
+     *
+     * @see https://www.php.net/manual/en/language.operators.arithmetic.php#language.operators.arithmetic
+     */
     protected function resolveExprBinaryOpMod(Expr\BinaryOp\Mod $node): int
     {
         return $this->resolve($node->left) % $this->resolve($node->right);
@@ -336,7 +476,7 @@ class NodeExpressionResolver
         return !$this->resolve($node->expr);
     }
 
-    protected function resolveExprBitwiseNot(Expr\BitwiseNot $node)
+    protected function resolveExprBitwiseNot(Expr\BitwiseNot $node): int|string
     {
         return ~$this->resolve($node->expr);
     }
@@ -371,7 +511,7 @@ class NodeExpressionResolver
         return $this->resolve($node->left) . $this->resolve($node->right);
     }
 
-    protected function resolveExprTernary(Expr\Ternary $node)
+    protected function resolveExprTernary(Expr\Ternary $node): mixed
     {
         if (isset($node->if)) {
             // Full syntax $a ? $b : $c;
@@ -449,6 +589,16 @@ class NodeExpressionResolver
         return $this->resolve($node->left) xor $this->resolve($node->right);
     }
 
+    protected function resolveExprUnaryMinus(Expr\UnaryMinus $node): int|float
+    {
+        return -$this->resolve($node->expr);
+    }
+
+    protected function resolveExprUnaryPlus(Expr\UnaryPlus $node): int|float
+    {
+        return $this->resolve($node->expr);
+    }
+
     private function getDispatchMethodFor(Node $node): string
     {
         $nodeType = $node->getType();
@@ -472,6 +622,10 @@ class NodeExpressionResolver
      */
     private function fetchReflectionClass(Node\Name $node)
     {
+        // If we have already resolved node name, we should use it instead
+        if ($node->hasAttribute('resolvedName')) {
+            $node = $node->getAttribute('resolvedName');
+        }
         $className  = $node->toString();
         $isFQNClass = $node instanceof Node\Name\FullyQualified;
         if ($isFQNClass) {

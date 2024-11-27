@@ -11,13 +11,17 @@ declare(strict_types=1);
 
 namespace Go\ParserReflection\Stub;
 
-function miscScalarParameters(
-    int $acceptsInteger,
-    string $acceptsString,
-    bool $acceptsBool,
-    int $acceptsVariadicInteger,
-    array $acceptsArray = ['some' => ['value' => 'for', 'array' => 'to dump']],
-    float $acceptsFloat = \INF,
-    string ...$acceptsDefaultString
-) {
+use JetBrains\PhpStorm\ArrayShape;
+use JetBrains\PhpStorm\Deprecated;
+
+#[Deprecated('some arg')]
+class RandomClassWithAttribute
+{
+    #[ArrayShape([
+        'token' => 'string',
+        'code' => 'integer'
+    ])]
+    public $foo;
 }
+
+throw new \RuntimeException('test');

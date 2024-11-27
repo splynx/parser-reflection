@@ -20,38 +20,18 @@ use ReflectionNamedType as BaseReflectionNamedType;
 class ReflectionNamedType extends BaseReflectionNamedType
 {
     /**
-     * If type allows null or not
-     *
-     * @var bool
-     */
-    private $allowsNull;
-
-    /**
-     * Is type built-in or not
-     *
-     * @var
-     */
-    private $isBuiltin;
-
-    /**
-     * @var string Type name
-     */
-    private $type;
-
-    /**
      * Initializes reflection data
      */
-    public function __construct($type, $allowsNull, $isBuiltin)
-    {
-        $this->type       = $type;
-        $this->allowsNull = $allowsNull;
-        $this->isBuiltin  = $isBuiltin;
-    }
+    public function __construct(
+        private readonly string $type,
+        private readonly bool $allowsNull,
+        private readonly bool $isBuiltin
+    ) {}
 
     /**
      * @inheritDoc
      */
-    public function allowsNull()
+    public function allowsNull(): bool
     {
         return $this->allowsNull;
     }
@@ -59,7 +39,7 @@ class ReflectionNamedType extends BaseReflectionNamedType
     /**
      * @inheritDoc
      */
-    public function isBuiltin()
+    public function isBuiltin(): bool
     {
         return $this->isBuiltin;
     }
@@ -67,15 +47,17 @@ class ReflectionNamedType extends BaseReflectionNamedType
     /**
      * @inheritDoc
      */
-    public function __toString()
+    public function __toString(): string
     {
-        return $this->type;
+        $allowsNull = $this->allowsNull && !in_array($this->type,['null', 'mixed'], true);
+
+        return $allowsNull ? '?' . $this->type : $this->type;
     }
 
     /**
      * @inheritDoc
      */
-    public function getName()
+    public function getName(): string
     {
         return $this->type;
     }
